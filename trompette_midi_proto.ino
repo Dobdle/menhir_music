@@ -2,21 +2,7 @@
  * ============================================================================
  * PROJET : TROMPETTE MIDI AUGMENTÉE (Phase 1 - Prototype Monolithique)
  * CIBLE  : Seeed Studio XIAO ESP32-S3 Sense (Core Arduino ESP32 v3.x / IDF v5)
- * VERSION: v1.5.1-proto
- * ============================================================================
- * ARCHITECTURE INTER-CŒURS (Producteur - Consommateur) :
- * - CŒUR 0 (Producteur DSP) : Acquisition I2S PDM via DMA + Algorithme YIN
- *   100% en virgule flottante (float) + Fenêtrage dynamique (Mode Lead/Bass).
- * - CŒUR 1 (Consommateur Musical) : Machine à états MIDI, Hystérésis,
- *   Détection Legato par Transitoire de Périodicité, Pitch Bend continu (Ch 1),
- *   Boutons avec intégrateur numérique anti-EMI (Ch 2) et Mode Track & Hold.
- *   Vélocité dynamique (dB de la crête d'attaque) + Expression continue CC11
- *   (enveloppe RMS lissée à ~500 Hz, attaque/relâchement séparés).
- *
- * CONFIGURATION ARDUINO IDE OBLIGATOIRE :
- * - Board            : "Seeed Studio XIAO ESP32S3"
- * - USB CDC On Boot  : "Enabled"
- * - USB Mode         : "USB-OTG (TinyUSB)"
+ * VERSION: v1.5.1-proto (Avec lissage anti-artefacts)
  * ============================================================================
  */
 
@@ -25,16 +11,12 @@
 #include <USB.h>
 #include <USBMIDI.h>
 #include "config.h"
-#include "soc/rtc_cntl_reg.h"  // Commande 'U' : reboot en mode téléchargement
+#include "soc/rtc_cntl_reg.h"
 
 #if ARDUINO_USB_MODE
 #error "USB Mode doit être 'USB-OTG (TinyUSB)' (Outils > USB Mode). 'Hardware CDC and JTAG' désactive l'USB MIDI."
 #endif
 
-// --- CONSOLE SÉRIE USB (indépendante du réglage "USB CDC On Boot") ---
-// Si "USB CDC On Boot" est désactivé dans l'IDE, `Serial` pointe vers l'UART0
-// (broche TX) et aucun port /dev/ttyACM n'apparaît. On crée alors nous-mêmes
-// l'interface CDC : son constructeur global l'enregistre AVANT USB.begin().
 #if ARDUINO_USB_CDC_ON_BOOT
 #define Console Serial
 #else
@@ -44,10 +26,10 @@ USBCDC Console;
 // --- VARIABLES PARTAGÉES INTER-CŒURS (Cœur 0 -> Cœur 1) ---
 volatile float shared_raw_freq = 0.0f;
 volatile float shared_peak_amp = 0.0f;
-volatile float shared_rms_amp = 0.0f;   // Niveau efficace (RMS) : bien plus stable que la crête
+volatile float shared_rms_amp = 0.0f;
 volatile float shared_yin_quality = 1.0f;
-volatile bool isBassMode = true; // Actif par défaut pour garantir les sous-harmoniques
-volatile uint32_t shared_frame_id = 0; // Incrémenté à chaque trame DSP analysée (32 ms)
+volatile bool isBassMode = true;
+volatile uint32_t shared_frame_id = 0;
 
 // --- RESSOURCES CŒUR 0 (DSP) ---
 TaskHandle_t AudioTask;
@@ -71,27 +53,33 @@ bool isMidiSent = false;
 int lastSentNote = 0;
 int lastSentPitchBend = 8192;
 
+// --- NOUVEAU : LISSAGE & FILTRAGE ARTEFACTS (CŒUR 1) ---
+float freq_history[3] = {0.0f, 0.0f, 0.0f};
+int freq_idx = 0;
+float last_good_freq = 0.0f;
+float smoothed_pb = 8192.0f;
+
 // --- VÉLOCITÉ & EXPRESSION ---
-int currentVelocity = 100;       // Vélocité de la dernière attaque (réutilisée en legato)
-bool velocityPending = false;    // Attaque détectée, NoteOn retenu le temps de capter le pic
-float attackPeakMax = 0.0f;      // Crête max observée pendant la fenêtre d'attaque
+int currentVelocity = 100;
+bool velocityPending = false;
+float attackPeakMax = 0.0f;
 uint32_t attackStartFrame = 0;
-float expressionEnv = 0.0f;      // Enveloppe de souffle lissée (0..127, flottant)
-int lastSentExpression = -1;     // Dernière valeur envoyée (7 bits, ou 14 bits si activé)
+float expressionEnv = 0.0f;
+int lastSentExpression = -1;
 uint32_t lastExprUpdateUs = 0;
 uint32_t lastExprSendMs = 0;
-bool velocityDebug = false;      // Commande série 'V' : log de calibration
-float debugPeakMax = 0.0f;       // Plus forte crête vue depuis l'activation du debug
-float debugRmsMax = 0.0f;        // Plus fort RMS vu depuis l'activation du debug
+bool velocityDebug = false;
+float debugPeakMax = 0.0f;
+float debugRmsMax = 0.0f;
 
-// --- RESSOURCES BOUTON 1 (D0 / GPIO 1) & TRACK AND HOLD ---
+// --- RESSOURCES BOUTON 1 & TRACK AND HOLD ---
 enum Button1Mode {
-  BTN_MODE_TRIGGER_C0,   // Envoie la note C0 sur le Canal 2
-  BTN_MODE_TRACK_HOLD    // Verrouille la note actuelle de la trompette en drone sur le Canal 2
+  BTN_MODE_TRIGGER_C0,
+  BTN_MODE_TRACK_HOLD
 };
 
 Button1Mode currentBtn1Mode = BTN_MODE_TRIGGER_C0;
-int btn1Integrator = 0;       // Compteur d'intégration numérique anti-EMI (0 à EMI_INTEGRATOR_MAX)
+int btn1Integrator = 0;
 bool btn1StablePressed = false;
 bool btn1NoteActive = false;
 int heldBassNote = MIDI_NOTE_C0;
@@ -101,8 +89,6 @@ float midiToFreq(int midiNote) {
   return 440.0f * powf(2.0f, (midiNote - 69.0f) / 12.0f);
 }
 
-// Convertit une amplitude crête en valeur MIDI [outMin..outMax] sur une échelle
-// logarithmique : l'oreille (et le souffle) perçoivent les nuances en dB.
 int peakToMidi(float peak, int outMin, int outMax) {
   if (peak <= NOISE_GATE_PEAK) return outMin;
   float db = 20.0f * log10f(peak / NOISE_GATE_PEAK);
@@ -114,14 +100,12 @@ int peakToMidi(float peak, int outMin, int outMax) {
   return outMin + (int)lroundf(norm * (outMax - outMin));
 }
 
-// Ouvre la fenêtre de capture de vélocité (coup de langue / attaque depuis le silence)
 void beginVelocityCapture(float peak) {
   velocityPending = true;
   attackPeakMax = peak;
   attackStartFrame = shared_frame_id;
 }
 
-// Convertit le niveau RMS en expression continue 0..127 (flottant, échelle dB)
 float rmsToExpression(float rms) {
   if (rms <= EXPRESSION_RMS_FLOOR) return 0.0f;
   float norm = log10f(rms / EXPRESSION_RMS_FLOOR) / log10f(EXPRESSION_RMS_MAX / EXPRESSION_RMS_FLOOR);
@@ -130,7 +114,6 @@ float rmsToExpression(float rms) {
   return norm * 127.0f;
 }
 
-// Envoie l'expression (7 bits, ou 14 bits MSB CC11 + LSB CC43)
 void sendExpression(float env) {
 #if EXPRESSION_14BIT
   int v14 = (int)lroundf(env / 127.0f * 16383.0f);
@@ -170,7 +153,6 @@ void audio_pitch_task(void *pvParameters) {
     if (result == ESP_OK && bytesIn > 0) {
       int numSamples = bytesIn / sizeof(int16_t);
 
-      // Fenêtrage logiciel dynamique selon le mode (BASS = 100%, LEAD = 50% plus récents)
       int activeSamples = isBassMode ? numSamples : (numSamples / 2);
       int startIndex = numSamples - activeSamples;
 
@@ -183,14 +165,12 @@ void audio_pitch_task(void *pvParameters) {
         continue;
       }
 
-      // 1. Calcul de l'Offset DC (Moyenne)
       float mean = 0.0f;
       for (int i = startIndex; i < numSamples; i++) {
         mean += samples[i];
       }
       mean /= activeSamples;
 
-      // 2. Mesure de l'amplitude crête (Peak) et du niveau efficace (RMS)
       float peak = 0.0f;
       float sum_sq = 0.0f;
       for (int i = startIndex; i < numSamples; i++) {
@@ -202,12 +182,10 @@ void audio_pitch_task(void *pvParameters) {
       shared_peak_amp = peak;
       shared_rms_amp = sqrtf(sum_sq / activeSamples);
 
-      // 3. Algorithme YIN (Uniquement si le signal dépasse le Noise Gate)
       if (peak > NOISE_GATE_PEAK) {
         float yin_buffer[max_period + 1];
         yin_buffer[0] = 1.0f;
 
-        // Étape 3a : Fonction de différence en virgule flottante (zéro risque d'overflow)
         for (int tau = 1; tau <= max_period; tau++) {
           float diff_sum = 0.0f;
           for (int i = 0; i < window_size; i++) {
@@ -218,7 +196,6 @@ void audio_pitch_task(void *pvParameters) {
           yin_buffer[tau] = diff_sum / 100000000.0f;
         }
 
-        // Étape 3b : Différence cumulée normalisée (CMND)
         float running_sum = 0.0f;
         for (int tau = 1; tau <= max_period; tau++) {
           running_sum += yin_buffer[tau];
@@ -229,7 +206,6 @@ void audio_pitch_task(void *pvParameters) {
           }
         }
 
-        // Étape 3c : Seuil absolu (Premier creux sous YIN_THRESHOLD)
         int best_tau = -1;
         float current_yin_quality = 1.0f;
 
@@ -244,7 +220,6 @@ void audio_pitch_task(void *pvParameters) {
           }
         }
 
-        // Recherche du minimum global de secours si aucun creux n'est sous 0.15
         if (best_tau == -1) {
           float min_val = 1.0f;
           for (int tau = min_period; tau <= max_period; tau++) {
@@ -259,7 +234,6 @@ void audio_pitch_task(void *pvParameters) {
 
         shared_yin_quality = current_yin_quality;
 
-        // Étape 3d : Interpolation parabolique
         if (best_tau > 0) {
           float refined_period = (float)best_tau;
           if (best_tau > min_period && best_tau < max_period) {
@@ -293,16 +267,15 @@ void setup() {
   pinMode(BUTTON_2_PIN, INPUT_PULLUP);
 
   USBMidi.begin();
-  Console.begin(115200);  // Avant USB.begin() : l'interface CDC fait partie du descripteur
+  Console.begin(115200); 
   USB.begin();
 
-  delay(2500); // Laisse le temps à Fedora de monter le port /dev/ttyACM
+  delay(2500);
   Console.println("====================================================");
   Console.printf("TROMPETTE MIDI_ - %s (XIAO ESP32-S3 Sense)\n", FW_VERSION);
-  Console.println("Commandes Série : 'B'=Mode BASS | 'L'=Mode LEAD | 'T'=Toggle Bouton (C0 / Track&Hold) | 'V'=Debug vélocité | 'U'=Mode flash");
+  Console.println("Commandes Série : 'B'=Mode BASS | 'L'=Mode LEAD | 'T'=Toggle Bouton | 'V'=Debug vélocité | 'U'=Mode flash");
   Console.println("====================================================");
 
-  // Configuration I2S PDM (API ESP-IDF v5)
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
   chan_cfg.dma_frame_num = DMA_FRAME_NUM;
 
@@ -327,7 +300,6 @@ void setup() {
     Console.println("[OK] Microphone PDM I2S initialisé.");
   }
 
-  // Lancement du moteur DSP sur le Cœur 0
   xTaskCreatePinnedToCore(
     audio_pitch_task,
     "AudioPitchTask",
@@ -340,7 +312,7 @@ void setup() {
 }
 
 // ============================================================================
-// CONSOMMATEUR : CŒUR 1 (Logique Musicale, Boutons Anti-EMI & USB MIDI)
+// CONSOMMATEUR : CŒUR 1 (Logique Musicale & MIDI)
 // ============================================================================
 void loop() {
   // 1. Commandes de contrôle via le Moniteur Série
@@ -348,21 +320,20 @@ void loop() {
     char cmd = Console.read();
     if (cmd == 'b' || cmd == 'B') {
       isBassMode = true;
-      Console.println("[MODE] BASS activé (Fenêtre 512, Min 60Hz)");
+      Console.println("[MODE] BASS activé");
     } else if (cmd == 'l' || cmd == 'L') {
       isBassMode = false;
-      Console.println("[MODE] LEAD activé (Fenêtre 256, Min 120Hz)");
+      Console.println("[MODE] LEAD activé");
     } else if (cmd == 't' || cmd == 'T') {
       if (currentBtn1Mode == BTN_MODE_TRIGGER_C0) {
         currentBtn1Mode = BTN_MODE_TRACK_HOLD;
-        Console.println("[BOUTON 1] Mode TRACK & HOLD (Verrouille la note jouée sur Canal 2)");
+        Console.println("[BOUTON 1] Mode TRACK & HOLD");
       } else {
         currentBtn1Mode = BTN_MODE_TRIGGER_C0;
-        Console.println("[BOUTON 1] Mode TRIGGER C0 (Joue C0 sur Canal 2)");
+        Console.println("[BOUTON 1] Mode TRIGGER C0");
       }
     } else if (cmd == 'u' || cmd == 'U') {
-      // Redémarre directement en mode téléchargement (équivalent bouton BOOT)
-      Console.println("[BOOT] Redemarrage en mode telechargement... (lancer l'upload)");
+      Console.println("[BOOT] Redemarrage en mode telechargement...");
       Console.flush();
       delay(100);
       REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
@@ -371,13 +342,12 @@ void loop() {
       velocityDebug = !velocityDebug;
       debugPeakMax = 0.0f;
       debugRmsMax = 0.0f;
-      Console.printf("[VELOCITE] Debug %s (jouer pp puis ff pour calibrer VELOCITY_PEAK_MAX)\n",
-                    velocityDebug ? "ON" : "OFF");
+      Console.printf("[VELOCITE] Debug %s\n", velocityDebug ? "ON" : "OFF");
     }
   }
 
   // 2. Lecture atomique des variables produites par le Cœur 0
-  float freq = shared_raw_freq;
+  float raw_f = shared_raw_freq;
   float peak = shared_peak_amp;
   float rms = shared_rms_amp;
   float yin_qual = shared_yin_quality;
@@ -392,7 +362,7 @@ void loop() {
     Console.printf("[EXPRESSION] Nouveau RMS max = %.0f\n", debugRmsMax);
   }
 
-  // 3. Détection des transitoires d'attaque (Coup de langue) vs Liaison (Legato)
+  // 3. Détection des transitoires d'attaque vs Liaison
   bool hard_attack = false;
   if (peak > NOISE_GATE_PEAK && peak > (last_peak * 1.5f)) {
     hard_attack = true;
@@ -406,6 +376,29 @@ void loop() {
   }
   last_yin_quality = yin_qual;
 
+  // --- 3bis. LISSAGE DE LA FRÉQUENCE ET REJET DES ARTEFACTS ---
+  float freq = 0.0f;
+  if (raw_f > 0.0f) {
+    // Filtre médian sur 3 échantillons (Rejette les pics isolés)
+    freq_history[freq_idx] = raw_f;
+    freq_idx = (freq_idx + 1) % 3;
+    float f1 = freq_history[0], f2 = freq_history[1], f3 = freq_history[2];
+    float median_freq = max(min(f1,f2), min(max(f1,f2),f3));
+
+    // Gate de confiance YIN : Ignore la médiane si le son est trop instable
+    // (sauf lors d'une attaque franche où la turbulence est normale)
+    if (yin_qual > 0.25f && !hard_attack) {
+      freq = last_good_freq;
+    } else {
+      freq = median_freq;
+      last_good_freq = freq;
+    }
+  } else {
+    // Réinitialisation du buffer au silence pour éviter les artefacts d'anciennes notes
+    freq_history[0] = 0.0f; freq_history[1] = 0.0f; freq_history[2] = 0.0f;
+    last_good_freq = 0.0f;
+  }
+
   // 4. Calcul de la Note MIDI, Hystérésis & Pitch Bend
   int pb_val = 8192;
 
@@ -417,21 +410,23 @@ void loop() {
       float theoretical_freq = midiToFreq(currentMidiNote);
       float deviation_semitones = 12.0f * log2f(freq / theoretical_freq);
 
-      pb_val = 8192 + (int)((deviation_semitones / PITCHBEND_RANGE) * 8192.0f);
-      if (pb_val > 16383) pb_val = 16383;
-      if (pb_val < 0) pb_val = 0;
+      int target_pb = 8192 + (int)((deviation_semitones / PITCHBEND_RANGE) * 8192.0f);
+      if (target_pb > 16383) target_pb = 16383;
+      if (target_pb < 0) target_pb = 0;
+
+      // Lissage exponentiel du Pitch Bend pour des transitions vocales/organiques
+      smoothed_pb += 0.2f * ((float)target_pb - smoothed_pb);
+      pb_val = (int)smoothed_pb;
 
       float diff = fabsf(exact_midi_float - (float)currentMidiNote);
       float hysteresis_limit = isBassMode ? 1.0f : 0.7f;
 
-      // Coup de langue répété sur la même note
       if (hard_attack && diff <= hysteresis_limit) {
         isSlur = false;
         attackCounter++;
         beginVelocityCapture(peak);
       }
 
-      // Changement de note au-delà du seuil d'hystérésis
       if (diff > hysteresis_limit) {
         if (proposedMidiNote == targetNewNote) {
           newNoteCounter++;
@@ -446,26 +441,30 @@ void loop() {
           newNoteCounter = 0;
 
           if (periodic_transient && !hard_attack) {
-            isSlur = true;  // Legato : on conserve la vélocité courante (pas de nouvelle attaque)
+            isSlur = true;
           } else {
             isSlur = false;
             beginVelocityCapture(peak);
           }
           attackCounter++;
+          
           pb_val = 8192;
+          smoothed_pb = 8192.0f; // Reset au changement de note
         }
       } else {
         newNoteCounter = 0;
       }
     } else {
-      // Première attaque depuis le silence
+      // Première attaque
       currentMidiNote = proposedMidiNote;
       noteIsPlaying = true;
       newNoteCounter = 0;
       isSlur = false;
       attackCounter++;
       beginVelocityCapture(peak);
+      
       pb_val = 8192;
+      smoothed_pb = 8192.0f; // Reset
     }
   } else {
     if (noteIsPlaying) {
@@ -473,15 +472,13 @@ void loop() {
     }
   }
 
-  // 5. Envoi des événements MIDI de la Trompette (Canal 1)
+  // 5. Envoi des événements MIDI (Canal 1)
   bool play = noteIsPlaying;
   int note = currentMidiNote;
 
-  // 4b. Résolution de la vélocité : on suit la crête pendant VELOCITY_ATTACK_FRAMES
-  //     trames pour capter le vrai sommet de l'attaque (compromis latence / précision).
   if (velocityPending) {
     if (!play) {
-      velocityPending = false;  // Attaque avortée (souffle trop court)
+      velocityPending = false;
     } else {
       if (peak > attackPeakMax) attackPeakMax = peak;
       if ((uint32_t)(frame - attackStartFrame) >= VELOCITY_ATTACK_FRAMES) {
@@ -497,17 +494,14 @@ void loop() {
   if (play && !velocityPending && (!isMidiSent || note != lastSentNote || attackCounter != lastSentAttack)) {
     if (isMidiSent) {
       if (isSlur && note != lastSentNote) {
-        // Mode LEGATO : Superposition (Nouveau NoteOn AVANT l'ancien NoteOff)
         USBMidi.noteOn(note, currentVelocity, MIDI_CH_PITCH);
         USBMidi.noteOff(lastSentNote, 0, MIDI_CH_PITCH);
       } else {
-        // Mode STACCATO : Séparation franche
         USBMidi.noteOff(lastSentNote, 0, MIDI_CH_PITCH);
         USBMidi.noteOn(note, currentVelocity, MIDI_CH_PITCH);
       }
     } else {
 #if EXPRESSION_ENABLED
-      // Pré-positionne l'expression AVANT le NoteOn pour que le son démarre au bon niveau
       expressionEnv = rmsToExpression(rms);
       sendExpression(expressionEnv);
 #endif
@@ -521,14 +515,11 @@ void loop() {
     USBMidi.noteOff(lastSentNote, 0, MIDI_CH_PITCH);
     USBMidi.pitchBend((uint16_t)8192, MIDI_CH_PITCH);
     lastSentPitchBend = 8192;
+    smoothed_pb = 8192.0f; // Remise à plat du lissage en fin de note
     isMidiSent = false;
   }
 
 #if EXPRESSION_ENABLED
-  // Expression continue (CC11) : enveloppe calculée à CHAQUE loop (~2 ms) et non
-  // plus une fois par trame DSP (32 ms). Le filtre à un pôle glisse vers la cible
-  // avec une constante de temps d'attaque (montée) et de relâchement (descente),
-  // ce qui transforme les marches d'escalier en rampes continues.
   {
     uint32_t nowUs = micros();
     float dt_ms = (nowUs - lastExprUpdateUs) / 1000.0f;
@@ -549,7 +540,7 @@ void loop() {
   }
 #endif
 
-  // Envoi du Pitch Bend continu (avec filtre de zone morte pour ne pas saturer l'USB)
+  // Envoi du Pitch Bend continu
   if (play && isMidiSent) {
     if (abs(pb_val - lastSentPitchBend) > PITCHBEND_DEADBAND) {
       USBMidi.pitchBend((uint16_t)pb_val, MIDI_CH_PITCH);
@@ -557,7 +548,7 @@ void loop() {
     }
   }
 
-  // 6. Lecture du Bouton 1 (D0) avec Intégrateur Numérique Anti-EMI (Canal 2)
+  // 6. Lecture du Bouton 1 avec Intégrateur
   int rawBtn1 = digitalRead(BUTTON_1_PIN);
   if (rawBtn1 == LOW) {
     if (btn1Integrator < EMI_INTEGRATOR_MAX) {
@@ -569,17 +560,15 @@ void loop() {
     }
   }
 
-  // Verrouillage d'état par hystérésis sur l'intégrateur
   if (btn1Integrator >= EMI_INTEGRATOR_MAX && !btn1StablePressed) {
     btn1StablePressed = true;
 
     if (currentBtn1Mode == BTN_MODE_TRACK_HOLD && noteIsPlaying) {
-      heldBassNote = currentMidiNote; // Échantillonne la note actuelle de la trompette
+      heldBassNote = currentMidiNote;
     } else {
       heldBassNote = MIDI_NOTE_C0;
     }
 
-    // En Track & Hold, la basse hérite de la dynamique de la trompette
     int btnVelocity = (currentBtn1Mode == BTN_MODE_TRACK_HOLD && noteIsPlaying) ? currentVelocity : 100;
     USBMidi.noteOn(heldBassNote, btnVelocity, MIDI_CH_BUTTON_1);
     btn1NoteActive = true;
@@ -594,5 +583,5 @@ void loop() {
     }
   }
 
-  vTaskDelay(2); // Boucle temps réel cadencée à 2 ms (500 Hz)
+  vTaskDelay(2);
 }
